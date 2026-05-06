@@ -5,7 +5,7 @@ matplotlib
 seaborn
 scikit-learn
 librosa
-tensorflow
+tensorflow-cpu
 hmmlearn
 soundfile
 ffmpeg-python
