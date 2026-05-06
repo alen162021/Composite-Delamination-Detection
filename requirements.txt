@@ -1,8 +1,11 @@
 streamlit
-librosa
 numpy
-scikit-learn
-joblib
 pandas
 matplotlib
-scipy
+seaborn
+scikit-learn
+librosa
+tensorflow
+hmmlearn
+soundfile
+ffmpeg-python
