@@ -9,3 +9,5 @@ tensorflow
 hmmlearn
 soundfile
 ffmpeg-python
+audioread
+numba
