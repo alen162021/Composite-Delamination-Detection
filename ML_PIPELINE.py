@@ -1,42 +1,119 @@
 import streamlit as st
 import numpy as np
+import pandas as pd
 import librosa
+import librosa.display
 import matplotlib.pyplot as plt
-import tempfile
-import soundfile as sf
+import seaborn as sns
 import zipfile
+import tempfile
 import os
 import re
+import soundfile as sf
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    classification_report
+)
+
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
 
 # ============================================================
 # PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
-    page_title="Smart Flange Detection",
+    page_title="Flange Looseness Detection",
     page_icon="🔩",
     layout="wide"
 )
 
-st.title("🔩 Smart Flange Loosening Detection")
+st.title("🔩 Flange Looseness Detection & Machine Learning")
+st.caption("""
+Upload a ZIP dataset containing percussion recordings.
 
-st.write("""
-Upload ONE zip file containing:
-- labeled training files
-- unlabeled experimental files
+Training files:
+- 0ftlbF1A1.m4a
+- 25ftlbF2A3.mp4
+- 50ftlbF4A2.m4a
 
-Example:
-- 0ftlbF1A1.wav
-- 25ftlbF2A2.wav
-- 50ftlbF3A1.wav
-- F1A2.wav
-- F4A1.wav
+Unknown prediction files:
+- F1A1.m4a
+- F2A2.mp4
 """)
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.header("📘 About")
+
+    st.write("""
+This application performs:
+
+- Audio signal processing
+- Feature extraction
+- Multi-class torque classification
+- Confusion matrix evaluation
+- Unknown flange prediction
+
+Supported labels:
+- 0 ft-lb
+- 25 ft-lb
+- 50 ft-lb
+""")
+
+# ============================================================
+# FILE PARSING
+# ============================================================
+
+def parse_training_filename(filename):
+
+    filename = filename.replace(".mp4", "")
+    filename = filename.replace(".m4a", "")
+    filename = filename.replace(".wav", "")
+
+    match = re.match(
+        r"(\d+)ftlbF(\d)A(\d)",
+        filename
+    )
+
+    if match:
+
+        torque = int(match.group(1))
+        flange = f"F{match.group(2)}"
+        area = f"A{match.group(3)}"
+
+        return torque, flange, area
+
+    return None
+
+
+def parse_unknown_filename(filename):
+
+    filename = filename.replace(".mp4", "")
+    filename = filename.replace(".m4a", "")
+    filename = filename.replace(".wav", "")
+
+    match = re.match(r"F(\d)A(\d)", filename)
+
+    if match:
+
+        flange = f"F{match.group(1)}"
+        area = f"A{match.group(2)}"
+
+        return flange, area
+
+    return None
 
 # ============================================================
 # AUDIO LOADING
@@ -45,6 +122,7 @@ Example:
 def load_audio(path):
 
     try:
+
         signal, sr = librosa.load(path, sr=22050)
 
     except:
@@ -54,24 +132,35 @@ def load_audio(path):
         if len(signal.shape) > 1:
             signal = np.mean(signal, axis=1)
 
-    signal = signal / (np.max(np.abs(signal)) + 1e-9)
+    signal = signal.astype(np.float32)
+
+    signal = (
+        signal - np.mean(signal)
+    ) / (np.std(signal) + 1e-9)
 
     return signal, sr
 
 # ============================================================
-# SPLIT IMPACTS
+# HIT SPLITTING
 # ============================================================
 
 def split_hits(signal, sr):
 
+    signal = signal / (
+        np.max(np.abs(signal)) + 1e-9
+    )
+
     energy = librosa.feature.rms(y=signal)[0]
 
-    threshold = np.mean(energy) * 1.5
+    threshold = (
+        np.mean(energy)
+        + 0.5 * np.std(energy)
+    )
 
     frames = np.where(energy > threshold)[0]
 
-    if len(frames) == 0:
-        return []
+    if len(frames) < 5:
+        return [signal]
 
     segments = np.split(
         frames,
@@ -83,7 +172,7 @@ def split_hits(signal, sr):
     for seg in segments:
 
         start = seg[0] * 512
-        end = seg[-1] * 512
+        end = min(len(signal), seg[-1] * 512)
 
         hit = signal[start:end]
 
@@ -93,7 +182,7 @@ def split_hits(signal, sr):
     return hits
 
 # ============================================================
-# FEATURES
+# FEATURE EXTRACTION
 # ============================================================
 
 def extract_features(signal, sr):
@@ -107,14 +196,14 @@ def extract_features(signal, sr):
         axis=1
     )
 
-    centroid = np.mean(
+    spectral_centroid = np.mean(
         librosa.feature.spectral_centroid(
             y=signal,
             sr=sr
         )
     )
 
-    rolloff = np.mean(
+    spectral_rolloff = np.mean(
         librosa.feature.spectral_rolloff(
             y=signal,
             sr=sr
@@ -125,78 +214,75 @@ def extract_features(signal, sr):
         librosa.feature.zero_crossing_rate(signal)
     )
 
-    energy = np.mean(signal**2)
+    rms = np.mean(signal ** 2)
+
+    fft = np.abs(np.fft.rfft(signal))
+    fft_mean = np.mean(fft)
 
     return np.hstack([
+
         mfcc,
-        centroid,
-        rolloff,
+
+        spectral_centroid,
+        spectral_rolloff,
+
         zcr,
-        energy
+        rms,
+        fft_mean
     ])
 
 # ============================================================
-# PARSE FILENAME
+# VISUALIZATION
 # ============================================================
 
-def parse_filename(name):
+def plot_waveform(signal):
 
-    name = name.lower()
+    fig, ax = plt.subplots(figsize=(10,3))
 
-    # TRAINING FILE
-    match = re.search(
-        r"(\d+)ftlb",
-        name
+    ax.plot(signal)
+
+    ax.set_title("Waveform")
+
+    st.pyplot(fig)
+
+
+def plot_fft(signal, sr):
+
+    fft = np.abs(np.fft.rfft(signal))
+
+    freqs = np.fft.rfftfreq(
+        len(signal),
+        1/sr
     )
 
-    if match:
+    fig, ax = plt.subplots(figsize=(10,3))
 
-        torque = int(match.group(1))
+    ax.plot(freqs, fft)
 
-        return torque
+    ax.set_title("FFT Spectrum")
 
-    # EXPERIMENTAL FILE
-    return None
+    ax.set_xlabel("Frequency (Hz)")
 
-# ============================================================
-# DRAW FLANGE
-# ============================================================
+    st.pyplot(fig)
 
-def draw_flange(prediction):
 
-    fig, ax = plt.subplots(figsize=(4,4))
+def plot_confusion_matrix(cm, labels, title):
 
-    circle = plt.Circle((0,0),1,fill=False,linewidth=6)
+    fig, ax = plt.subplots(figsize=(6,5))
 
-    ax.add_artist(circle)
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt='d',
+        cmap='Blues',
+        xticklabels=labels,
+        yticklabels=labels,
+        ax=ax
+    )
 
-    angles = np.linspace(0,2*np.pi,8,endpoint=False)
-
-    for a in angles:
-
-        x = np.cos(a)
-        y = np.sin(a)
-
-        if prediction <= 10:
-            color = "red"
-            size = 450
-
-        elif prediction <= 30:
-            color = "orange"
-            size = 380
-
-        else:
-            color = "green"
-            size = 300
-
-        ax.scatter(x,y,s=size,c=color)
-
-    ax.set_xlim(-1.5,1.5)
-    ax.set_ylim(-1.5,1.5)
-
-    ax.axis("off")
-
-    ax.set_aspect("equal")
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+    ax.set_title(title)
 
     st.pyplot(fig)
 
@@ -205,49 +291,57 @@ def draw_flange(prediction):
 # ============================================================
 
 uploaded_zip = st.file_uploader(
-    "Upload ZIP Dataset",
+    "📦 Upload ZIP Dataset",
     type=["zip"]
 )
 
 if uploaded_zip:
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    temp_dir = tempfile.mkdtemp()
 
-        zip_path = os.path.join(tmpdir, "data.zip")
+    zip_path = os.path.join(
+        temp_dir,
+        uploaded_zip.name
+    )
 
-        with open(zip_path, "wb") as f:
-            f.write(uploaded_zip.read())
+    with open(zip_path, "wb") as f:
+        f.write(uploaded_zip.read())
 
-        extract_dir = os.path.join(tmpdir, "data")
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        zip_ref.extractall(temp_dir)
 
-        with zipfile.ZipFile(zip_path, "r") as zip_ref:
-            zip_ref.extractall(extract_dir)
+    # ========================================================
+    # BUILD DATASET
+    # ========================================================
 
-        st.success("ZIP Extracted")
+    X = []
+    y = []
 
-        X_train = []
-        y_train = []
+    metadata = []
 
-        experimental = []
+    unknown_files = []
 
-        # ====================================================
-        # READ FILES
-        # ====================================================
+    audio_extensions = (
+        ".m4a",
+        ".mp4",
+        ".wav"
+    )
 
-        for root, dirs, files in os.walk(extract_dir):
+    for root, dirs, files in os.walk(temp_dir):
 
-            for file in files:
+        for file in files:
 
-                if not (
-                    file.endswith(".wav")
-                    or file.endswith(".mp4")
-                    or file.endswith(".m4a")
-                ):
-                    continue
+            if not file.endswith(audio_extensions):
+                continue
 
-                full_path = os.path.join(root, file)
+            full_path = os.path.join(root, file)
 
-                torque = parse_filename(file)
+            # TRAINING FILES
+            parsed = parse_training_filename(file)
+
+            if parsed is not None:
+
+                torque, flange, area = parsed
 
                 try:
 
@@ -255,119 +349,285 @@ if uploaded_zip:
 
                     hits = split_hits(signal, sr)
 
-                    features = [
-                        extract_features(h, sr)
-                        for h in hits
-                    ]
+                    for h in hits:
+
+                        features = extract_features(h, sr)
+
+                        X.append(features)
+
+                        y.append(torque)
+
+                        metadata.append({
+                            "file": file,
+                            "flange": flange,
+                            "area": area,
+                            "torque": torque
+                        })
 
                 except:
 
-                    st.warning(f"Could not process {file}")
-                    continue
-
-                # TRAINING FILE
-                if torque is not None:
-
-                    for feat in features:
-
-                        X_train.append(feat)
-                        y_train.append(torque)
-
-                # EXPERIMENTAL FILE
-                else:
-
-                    experimental.append(
-                        (file, features)
-                    )
-
-        # ====================================================
-        # TRAIN MODEL
-        # ====================================================
-
-        X_train = np.array(X_train)
-        y_train = np.array(y_train)
-
-        st.subheader("Training Data")
-
-        st.write("Samples:", len(X_train))
-
-        unique = np.unique(y_train)
-
-        st.write("Torque Classes:", unique)
-
-        if len(unique) < 2:
-
-            st.error("""
-            Need at least TWO torque classes.
-
-            Example:
-            - 0ftlb
-            - 25ftlb
-            """)
-
-            st.stop()
-
-        scaler = StandardScaler()
-
-        X_scaled = scaler.fit_transform(X_train)
-
-        Xtr, Xte, ytr, yte = train_test_split(
-            X_scaled,
-            y_train,
-            test_size=0.3,
-            random_state=42
-        )
-
-        model = RandomForestClassifier(
-            n_estimators=200,
-            random_state=42
-        )
-
-        model.fit(Xtr, ytr)
-
-        pred = model.predict(Xte)
-
-        acc = accuracy_score(yte, pred)
-
-        st.success(f"Validation Accuracy: {acc:.4f}")
-
-        # ====================================================
-        # EXPERIMENTAL PREDICTIONS
-        # ====================================================
-
-        st.header("Experimental Predictions")
-
-        for file, features in experimental:
-
-            if len(features) == 0:
-                continue
-
-            features = scaler.transform(features)
-
-            preds = model.predict(features)
-
-            final = int(np.bincount(preds).argmax())
-
-            st.subheader(file)
-
-            if final <= 10:
-
-                st.error(f"⚠️ VERY LOOSE → {final} ft-lbs")
-
-            elif final <= 30:
-
-                st.warning(f"⚠️ MODERATELY TIGHT → {final} ft-lbs")
+                    st.warning(f"Skipping corrupted file: {file}")
 
             else:
 
-                st.success(f"✅ TIGHT → {final} ft-lbs")
+                parsed_unknown = parse_unknown_filename(file)
 
-            draw_flange(final)
+                if parsed_unknown is not None:
 
-            fig, ax = plt.subplots()
+                    unknown_files.append({
+                        "file": file,
+                        "path": full_path,
+                        "flange": parsed_unknown[0],
+                        "area": parsed_unknown[1]
+                    })
 
-            ax.hist(preds)
+    # ========================================================
+    # CHECK DATA
+    # ========================================================
 
-            ax.set_title("Impact Predictions")
+    if len(X) == 0:
 
-            st.pyplot(fig)
+        st.error("No valid training files found.")
+
+        st.stop()
+
+    X = np.array(X)
+    y = np.array(y)
+
+    unique_classes = np.unique(y)
+
+    if len(unique_classes) < 2:
+
+        st.error("Need at least 2 torque classes.")
+
+        st.stop()
+
+    st.success(f"Training Samples Loaded: {len(X)}")
+
+    st.write("Detected Torque Classes:")
+
+    st.write(sorted(unique_classes))
+
+    # ========================================================
+    # SIGNAL DISPLAY
+    # ========================================================
+
+    st.header("📈 Signal Analysis")
+
+    sample_signal, sample_sr = load_audio(
+        os.path.join(root, file)
+    )
+
+    sample_hit = split_hits(
+        sample_signal,
+        sample_sr
+    )[0]
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        plot_waveform(sample_hit)
+
+    with col2:
+        plot_fft(sample_hit, sample_sr)
+
+    # ========================================================
+    # SPLIT
+    # ========================================================
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.3,
+        random_state=42,
+        stratify=y
+    )
+
+    scaler = StandardScaler()
+
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+
+    # ========================================================
+    # MODELS
+    # ========================================================
+
+    models = {
+
+        "Random Forest":
+            RandomForestClassifier(
+                n_estimators=100,
+                random_state=42
+            ),
+
+        "SVM":
+            SVC(
+                probability=True
+            ),
+
+        "Decision Tree":
+            DecisionTreeClassifier(
+                random_state=42
+            ),
+
+        "Logistic Regression":
+            LogisticRegression(
+                max_iter=2000
+            ),
+
+        "KNN":
+            KNeighborsClassifier()
+    }
+
+    # ========================================================
+    # TRAINING
+    # ========================================================
+
+    st.header("🤖 Model Evaluation")
+
+    results = []
+
+    best_model = None
+    best_acc = 0
+
+    for name, model in models.items():
+
+        model.fit(X_train, y_train)
+
+        pred = model.predict(X_test)
+
+        acc = accuracy_score(y_test, pred)
+
+        cm = confusion_matrix(y_test, pred)
+
+        results.append({
+            "Model": name,
+            "Accuracy": acc
+        })
+
+        if acc > best_acc:
+
+            best_acc = acc
+            best_model = model
+
+        st.subheader(name)
+
+        st.write(f"Accuracy: {acc:.4f}")
+
+        plot_confusion_matrix(
+            cm,
+            sorted(unique_classes),
+            f"{name} Confusion Matrix"
+        )
+
+        report = classification_report(
+            y_test,
+            pred,
+            output_dict=True
+        )
+
+        st.dataframe(
+            pd.DataFrame(report).transpose()
+        )
+
+    # ========================================================
+    # RESULTS TABLE
+    # ========================================================
+
+    st.header("📊 Overall Results")
+
+    results_df = pd.DataFrame(results)
+
+    st.dataframe(results_df)
+
+    best_name = results_df.sort_values(
+        "Accuracy",
+        ascending=False
+    ).iloc[0]["Model"]
+
+    st.success(
+        f"⭐ Best Model: {best_name}"
+    )
+
+    # ========================================================
+    # UNKNOWN PREDICTION
+    # ========================================================
+
+    if len(unknown_files) > 0:
+
+        st.header("🧪 Unknown Flange Prediction")
+
+        prediction_rows = []
+
+        for item in unknown_files:
+
+            try:
+
+                signal, sr = load_audio(item["path"])
+
+                hits = split_hits(signal, sr)
+
+                features = []
+
+                for h in hits:
+
+                    feat = extract_features(h, sr)
+
+                    features.append(feat)
+
+                if len(features) == 0:
+                    continue
+
+                features = scaler.transform(features)
+
+                preds = best_model.predict(features)
+
+                final_pred = np.bincount(preds).argmax()
+
+                confidence = np.mean(
+                    preds == final_pred
+                )
+
+                prediction_rows.append({
+
+                    "File": item["file"],
+                    "Flange": item["flange"],
+                    "Area": item["area"],
+                    "Predicted Torque":
+                        f"{final_pred} ft-lb",
+
+                    "Confidence":
+                        f"{confidence*100:.1f}%"
+                })
+
+            except:
+
+                st.warning(
+                    f"Could not process {item['file']}"
+                )
+
+        if len(prediction_rows) > 0:
+
+            pred_df = pd.DataFrame(
+                prediction_rows
+            )
+
+            st.dataframe(pred_df)
+
+    # ========================================================
+    # FLANGE ANALYSIS
+    # ========================================================
+
+    st.header("🔩 Flange Distribution")
+
+    metadata_df = pd.DataFrame(metadata)
+
+    flange_counts = (
+        metadata_df.groupby(
+            ["flange", "torque"]
+        )
+        .size()
+        .unstack(fill_value=0)
+    )
+
+    st.bar_chart(flange_counts)
