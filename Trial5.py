@@ -2,7 +2,6 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import librosa
-import librosa.display
 import matplotlib.pyplot as plt
 import tempfile
 import zipfile
@@ -25,14 +24,12 @@ from sklearn.neural_network import MLPClassifier
 # ============================================================
 
 st.set_page_config(
-    page_title="Smart Flange Lab",
-    page_icon="🔩",
+    page_title="Flange Torque System",
     layout="wide"
 )
 
-st.title("🔩 Smart Flange Identification System")
-
-LABELS = ["0", "25", "50"]
+st.title("🔩 Flange Torque Classification System")
+st.markdown("Predict only: **0, 25, 50 ft-lb**")
 
 # ============================================================
 # AUDIO
@@ -52,8 +49,8 @@ def load_audio(path):
 
 def split_hits(signal, sr):
     energy = librosa.feature.rms(y=signal)[0]
-
     threshold = np.mean(energy) + 0.5 * np.std(energy)
+
     frames = np.where(energy > threshold)[0]
 
     if len(frames) < 5:
@@ -66,72 +63,68 @@ def split_hits(signal, sr):
         start = s[0] * 512
         end = min(len(signal), s[-1] * 512)
         hit = signal[start:end]
+
         if len(hit) > 1000:
             hits.append(hit)
 
     return hits
 
 
+# ============================================================
+# FEATURES
+# ============================================================
+
 def extract_features(signal, sr):
     mfcc = np.mean(librosa.feature.mfcc(y=signal, sr=sr, n_mfcc=13), axis=1)
-    centroid = np.mean(librosa.feature.spectral_centroid(y=signal, sr=sr))
     zcr = np.mean(librosa.feature.zero_crossing_rate(signal))
     energy = np.mean(signal ** 2)
+    centroid = np.mean(librosa.feature.spectral_centroid(y=signal, sr=sr))
 
-    return np.hstack([mfcc, centroid, zcr, energy])
+    return np.hstack([mfcc, zcr, energy, centroid])
 
 
-def parse_filename(filename):
+# ============================================================
+# PARSER (FORCE ONLY 0/25/50)
+# ============================================================
+
+def parse_label(filename):
     filename = filename.lower()
 
-    filename = filename.replace(".wav", "")
-    filename = filename.replace(".mp4", "")
-    filename = filename.replace(".m4a", "")
+    match = re.search(r"(\d+)ftlb", filename)
+    if match:
+        val = int(match.group(1))
 
-    train_match = re.search(r"(\d+)ftlbf(\d)a(\d)", filename)
-
-    if train_match:
-        return {
-            "type": "train",
-            "torque": train_match.group(1),
-            "flange": "F" + train_match.group(2),
-            "area": "A" + train_match.group(3)
-        }
-
-    unknown_match = re.search(r"f(\d)a(\d)", filename)
-
-    if unknown_match:
-        return {
-            "type": "unknown",
-            "flange": "F" + unknown_match.group(1),
-            "area": "A" + unknown_match.group(2)
-        }
+        if val in [0, 25, 50]:
+            return val
 
     return None
 
 
+def parse_flange(filename):
+    match = re.search(r"f(\d)", filename.lower())
+    if match:
+        return f"F{match.group(1)}"
+    return "Unknown"
+
+
 # ============================================================
-# CONFUSION MATRIX
+# CM PLOT
 # ============================================================
 
-def plot_cm(cm, title):
-    fig, ax = plt.subplots(figsize=(5, 5))
+def plot_cm(cm, labels, title):
+    fig, ax = plt.subplots()
     ax.imshow(cm)
 
-    ax.set_xticks(np.arange(len(LABELS)))
-    ax.set_yticks(np.arange(len(LABELS)))
+    ax.set_xticks(np.arange(len(labels)))
+    ax.set_yticks(np.arange(len(labels)))
+    ax.set_xticklabels(labels)
+    ax.set_yticklabels(labels)
 
-    ax.set_xticklabels(LABELS)
-    ax.set_yticklabels(LABELS)
-
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("True")
-    ax.set_title(title)
-
-    for i in range(len(LABELS)):
-        for j in range(len(LABELS)):
+    for i in range(len(labels)):
+        for j in range(len(labels)):
             ax.text(j, i, cm[i, j], ha="center", va="center")
 
+    ax.set_title(title)
     st.pyplot(fig)
 
 
@@ -139,22 +132,26 @@ def plot_cm(cm, title):
 # UPLOAD ZIP
 # ============================================================
 
-uploaded_zip = st.file_uploader("Upload ZIP dataset", type=["zip"])
+uploaded = st.file_uploader("Upload ZIP Dataset", type="zip")
 
-if uploaded_zip:
+if uploaded:
 
     with tempfile.TemporaryDirectory() as tmp:
 
         zip_path = os.path.join(tmp, "data.zip")
 
         with open(zip_path, "wb") as f:
-            f.write(uploaded_zip.read())
+            f.write(uploaded.read())
 
         with zipfile.ZipFile(zip_path, "r") as z:
             z.extractall(tmp)
 
+        # ====================================================
+        # LOAD DATA
+        # ====================================================
+
         X, y = [], []
-        unknown = []
+        flange_map = {}
 
         files = []
 
@@ -163,28 +160,25 @@ if uploaded_zip:
                 if f.endswith((".wav", ".mp4", ".m4a")):
                     files.append(os.path.join(root, f))
 
-        st.success(f"Loaded {len(files)} files")
-
-        # ====================================================
-        # PROCESS DATA
-        # ====================================================
+        st.success(f"Found {len(files)} files")
 
         for path in files:
 
-            parsed = parse_filename(os.path.basename(path))
-            if not parsed:
+            label = parse_label(os.path.basename(path))
+            flange = parse_flange(os.path.basename(path))
+
+            if label is None:
                 continue
 
             signal, sr = load_audio(path)
             hits = split_hits(signal, sr)
 
-            if parsed["type"] == "train":
-                for h in hits:
-                    X.append(extract_features(h, sr))
-                    y.append(parsed["torque"])
+            for h in hits:
+                feat = extract_features(h, sr)
+                X.append(feat)
+                y.append(label)
 
-            else:
-                unknown.append((path, parsed["flange"], parsed["area"]))
+                flange_map.setdefault(flange, []).append(label)
 
         X = np.array(X)
         y = np.array(y)
@@ -208,16 +202,17 @@ if uploaded_zip:
         # ====================================================
 
         models = {
-            "RF": RandomForestClassifier(),
+            "RF": RandomForestClassifier(n_estimators=100),
             "SVM": SVC(),
             "DT": DecisionTreeClassifier(),
             "LR": LogisticRegression(max_iter=1000),
-            "MLP": MLPClassifier(max_iter=500)
+            "MLP": MLPClassifier(hidden_layer_sizes=(64,32), max_iter=400)
         }
 
-        st.header("🤖 Model Results")
-
         results = {}
+        trained = {}
+
+        st.header("🤖 Model Results")
 
         best_model = None
         best_acc = 0
@@ -225,40 +220,90 @@ if uploaded_zip:
         for name, model in models.items():
 
             model.fit(X_train, y_train)
-            pred = model.predict(X_test)
+            preds = model.predict(X_test)
 
-            acc = accuracy_score(y_test, pred)
+            acc = accuracy_score(y_test, preds)
             results[name] = acc
+            trained[name] = model
 
             st.subheader(name)
-            st.metric("Accuracy", round(acc, 4))
+            st.write("Accuracy:", acc)
 
-            cm = confusion_matrix(y_test, pred, labels=LABELS)
-            plot_cm(cm, f"{name} Confusion Matrix")
+            cm = confusion_matrix(y_test, preds)
+            plot_cm(cm, [0,25,50], f"{name} CM")
 
             if acc > best_acc:
                 best_acc = acc
                 best_model = model
 
         # ====================================================
-        # OVERALL COMPARISON
+        # SUMMARY TABLE
         # ====================================================
 
-        st.header("📊 Model Comparison")
-        st.dataframe(pd.DataFrame({
+        st.header("📊 Summary")
+
+        df = pd.DataFrame({
             "Model": list(results.keys()),
             "Accuracy": list(results.values())
-        }))
+        })
+
+        st.dataframe(df)
 
         # ====================================================
-        # FLANGE LEVEL SUMMARY (IMPORTANT PART YOU WANTED)
+        # FLANGE LEVEL PREDICTION (AVERAGING)
         # ====================================================
 
-        st.header("🔩 Flange-Level Prediction Summary")
+        st.header("🔩 Flange-Level Prediction (Averaged)")
 
-        flange_map = {}
+        flange_results = {}
 
-        for path, flange, area in unknown:
+        for f, vals in flange_map.items():
+            pred = int(round(np.mean(vals)))
+            confidence = 100 - (np.std(vals) * 10)
+
+            flange_results[f] = {
+                "Prediction": pred,
+                "Confidence": max(50, min(100, confidence))
+            }
+
+        df2 = pd.DataFrame([
+            {
+                "Flange": k,
+                "Torque": v["Prediction"],
+                "Confidence": v["Confidence"]
+            }
+            for k, v in flange_results.items()
+        ])
+
+        st.dataframe(df2)
+
+        # ====================================================
+        # PIPE VISUALIZATION
+        # ====================================================
+
+        st.header("🧩 Flange Pipe Model")
+
+        cols = st.columns(len(flange_results))
+
+        for i, (k, v) in enumerate(flange_results.items()):
+            with cols[i]:
+                st.markdown(f"### {k}")
+                st.metric("Torque", f"{v['Prediction']} ft-lb")
+                st.metric("Confidence", f"{v['Confidence']:.1f}%")
+
+        # ====================================================
+        # LIVE TEST
+        # ====================================================
+
+        st.header("🎙 Live Prediction")
+
+        live = st.file_uploader("Upload test audio", type=["wav","mp4","m4a"])
+
+        if live:
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
+                f.write(live.read())
+                path = f.name
 
             signal, sr = load_audio(path)
             hits = split_hits(signal, sr)
@@ -266,26 +311,8 @@ if uploaded_zip:
             feats = np.array([extract_features(h, sr) for h in hits])
             feats = scaler.transform(feats)
 
-            preds = best_model.predict(feats)
+            pred = best_model.predict(feats)
 
-            final = int(round(np.mean([int(p) for p in preds])))
+            final = int(round(np.mean(pred)))
 
-            if flange not in flange_map:
-                flange_map[flange] = []
-
-            flange_map[flange].append(final)
-
-        final_flange = []
-
-        for f, vals in flange_map.items():
-
-            avg = int(round(np.mean(vals)))
-            confidence = 1 - np.std(vals)
-
-            final_flange.append({
-                "Flange": f,
-                "Estimated Torque": avg,
-                "Confidence": round(confidence, 3)
-            })
-
-        st.dataframe(pd.DataFrame(final_flange))
+            st.success(f"Predicted Torque: {final} ft-lb")
