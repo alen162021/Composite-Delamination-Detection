@@ -1,19 +1,16 @@
 import streamlit as st
 import numpy as np
 import librosa
-import librosa.display
 import matplotlib.pyplot as plt
 import tempfile
 import soundfile as sf
+import zipfile
+import os
+import re
 
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, confusion_matrix
 from sklearn.preprocessing import StandardScaler
-
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score
 from sklearn.ensemble import RandomForestClassifier
 
 # ============================================================
@@ -21,39 +18,38 @@ from sklearn.ensemble import RandomForestClassifier
 # ============================================================
 
 st.set_page_config(
-    page_title="Flange Loosening Detection",
+    page_title="Smart Flange Detection",
     page_icon="🔩",
     layout="wide"
 )
 
 st.title("🔩 Smart Flange Loosening Detection")
 
-st.caption("""
-Machine Learning + Acoustic Percussion Analysis
-University of Houston
+st.write("""
+Upload ONE zip file containing:
+- labeled training files
+- unlabeled experimental files
+
+Example:
+- 0ftlbF1A1.wav
+- 25ftlbF2A2.wav
+- 50ftlbF3A1.wav
+- F1A2.wav
+- F4A1.wav
 """)
 
 # ============================================================
 # AUDIO LOADING
 # ============================================================
 
-def load_audio(file):
-
-    suffix = "." + file.name.split(".")[-1]
-
-    file.seek(0)
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(file.read())
-        tmp.flush()
-        tmp_path = tmp.name
+def load_audio(path):
 
     try:
-        signal, sr = librosa.load(tmp_path, sr=22050)
+        signal, sr = librosa.load(path, sr=22050)
 
-    except Exception:
+    except:
 
-        signal, sr = sf.read(tmp_path)
+        signal, sr = sf.read(path)
 
         if len(signal.shape) > 1:
             signal = np.mean(signal, axis=1)
@@ -63,51 +59,41 @@ def load_audio(file):
     return signal, sr
 
 # ============================================================
-# SPLIT IMPACT HITS
+# SPLIT IMPACTS
 # ============================================================
 
 def split_hits(signal, sr):
 
-    frame_length = int(0.02 * sr)
-    hop_length = int(0.01 * sr)
-
-    energy = librosa.feature.rms(
-        y=signal,
-        frame_length=frame_length,
-        hop_length=hop_length
-    )[0]
+    energy = librosa.feature.rms(y=signal)[0]
 
     threshold = np.mean(energy) * 1.5
 
-    indices = np.where(energy > threshold)[0]
+    frames = np.where(energy > threshold)[0]
 
-    if len(indices) == 0:
-        return [], []
+    if len(frames) == 0:
+        return []
 
     segments = np.split(
-        indices,
-        np.where(np.diff(indices) > 2)[0] + 1
+        frames,
+        np.where(np.diff(frames) > 2)[0] + 1
     )
 
     hits = []
-    boundaries = []
 
     for seg in segments:
 
-        start = seg[0] * hop_length
-        end = seg[-1] * hop_length
+        start = seg[0] * 512
+        end = seg[-1] * 512
 
         hit = signal[start:end]
 
-        if len(hit) > 200:
-
+        if len(hit) > 1000:
             hits.append(hit)
-            boundaries.append((start, end))
 
-    return hits, boundaries
+    return hits
 
 # ============================================================
-# FEATURE EXTRACTION
+# FEATURES
 # ============================================================
 
 def extract_features(signal, sr):
@@ -119,10 +105,6 @@ def extract_features(signal, sr):
             n_mfcc=13
         ),
         axis=1
-    )
-
-    zcr = np.mean(
-        librosa.feature.zero_crossing_rate(signal)
     )
 
     centroid = np.mean(
@@ -139,312 +121,253 @@ def extract_features(signal, sr):
         )
     )
 
-    rms = np.mean(signal**2)
+    zcr = np.mean(
+        librosa.feature.zero_crossing_rate(signal)
+    )
+
+    energy = np.mean(signal**2)
 
     return np.hstack([
         mfcc,
-        zcr,
         centroid,
         rolloff,
-        rms
+        zcr,
+        energy
     ])
 
 # ============================================================
-# BUILD DATASET
+# PARSE FILENAME
 # ============================================================
 
-def build_dataset(files):
+def parse_filename(name):
 
-    X = []
-    y = []
+    name = name.lower()
 
-    for file in files:
+    # TRAINING FILE
+    match = re.search(
+        r"(\d+)ftlb",
+        name
+    )
 
-        try:
-            signal, sr = load_audio(file)
+    if match:
 
-        except:
-            st.warning(f"Could not load {file.name}")
-            continue
+        torque = int(match.group(1))
 
-        hits, _ = split_hits(signal, sr)
+        return torque
 
-        # GOOD if filename contains TIGHT
-        # BAD if filename contains LOOSE
-
-        label = 1 if "loose" in file.name.lower() else 0
-
-        for h in hits:
-
-            X.append(extract_features(h, sr))
-            y.append(label)
-
-    return np.array(X), np.array(y)
+    # EXPERIMENTAL FILE
+    return None
 
 # ============================================================
-# CONFUSION MATRIX
+# DRAW FLANGE
 # ============================================================
 
-def plot_cm(cm, title):
+def draw_flange(prediction):
 
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize=(4,4))
 
-    ax.imshow(cm)
-
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, cm[i, j],
-                    ha="center",
-                    va="center")
-
-    ax.set_title(title)
-
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("True")
-
-    st.pyplot(fig)
-
-# ============================================================
-# FLANGE VISUALIZATION
-# ============================================================
-
-def draw_flange(loose_probability):
-
-    fig, ax = plt.subplots(figsize=(5,5))
-
-    circle = plt.Circle((0,0), 1, fill=False, linewidth=8)
+    circle = plt.Circle((0,0),1,fill=False,linewidth=6)
 
     ax.add_artist(circle)
 
-    angles = np.linspace(0, 2*np.pi, 8, endpoint=False)
+    angles = np.linspace(0,2*np.pi,8,endpoint=False)
 
     for a in angles:
 
         x = np.cos(a)
         y = np.sin(a)
 
-        if loose_probability > 0.5:
+        if prediction <= 10:
             color = "red"
             size = 450
+
+        elif prediction <= 30:
+            color = "orange"
+            size = 380
+
         else:
             color = "green"
             size = 300
 
-        ax.scatter(x, y, s=size, c=color)
+        ax.scatter(x,y,s=size,c=color)
 
-    ax.set_xlim(-1.5, 1.5)
-    ax.set_ylim(-1.5, 1.5)
-
-    ax.set_aspect("equal")
+    ax.set_xlim(-1.5,1.5)
+    ax.set_ylim(-1.5,1.5)
 
     ax.axis("off")
+
+    ax.set_aspect("equal")
 
     st.pyplot(fig)
 
 # ============================================================
-# SIDEBAR
+# ZIP UPLOAD
 # ============================================================
 
-with st.sidebar:
+uploaded_zip = st.file_uploader(
+    "Upload ZIP Dataset",
+    type=["zip"]
+)
 
-    st.header("📘 About")
+if uploaded_zip:
 
-    st.write("""
-    This app detects flange loosening using:
+    with tempfile.TemporaryDirectory() as tmpdir:
 
-    - Percussion acoustics
-    - Signal processing
-    - Machine learning
-    - MFCC acoustic fingerprints
-    """)
+        zip_path = os.path.join(tmpdir, "data.zip")
 
-    st.write("""
-    Upload percussion recordings of:
-    - Tight flanges
-    - Loose flanges
+        with open(zip_path, "wb") as f:
+            f.write(uploaded_zip.read())
 
-    The app automatically:
-    1. Splits impacts
-    2. Extracts features
-    3. Trains ML models
-    4. Predicts flange health
-    """)
+        extract_dir = os.path.join(tmpdir, "data")
 
-# ============================================================
-# TABS
-# ============================================================
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(extract_dir)
 
-tab1, tab2, tab3 = st.tabs([
-    "📂 Upload",
-    "🤖 Training",
-    "🧪 Testing"
-])
+        st.success("ZIP Extracted")
 
-# ============================================================
-# TAB 1
-# ============================================================
+        X_train = []
+        y_train = []
 
-with tab1:
+        experimental = []
 
-    train_files = st.file_uploader(
-        "Upload Training Audio Files",
-        accept_multiple_files=True
-    )
+        # ====================================================
+        # READ FILES
+        # ====================================================
 
-    if train_files:
+        for root, dirs, files in os.walk(extract_dir):
 
-        X, y = build_dataset(train_files)
+            for file in files:
 
-        st.success(f"Extracted {len(X)} impact samples")
+                if not (
+                    file.endswith(".wav")
+                    or file.endswith(".mp4")
+                    or file.endswith(".m4a")
+                ):
+                    continue
 
-        st.session_state["X"] = X
-        st.session_state["y"] = y
+                full_path = os.path.join(root, file)
 
-        fig, ax = plt.subplots()
+                torque = parse_filename(file)
 
-        unique, counts = np.unique(y, return_counts=True)
+                try:
 
-        labels = ["Tight", "Loose"]
+                    signal, sr = load_audio(full_path)
 
-        ax.bar(labels, counts)
+                    hits = split_hits(signal, sr)
 
-        st.pyplot(fig)
+                    features = [
+                        extract_features(h, sr)
+                        for h in hits
+                    ]
 
-# ============================================================
-# TAB 2
-# ============================================================
+                except:
 
-with tab2:
+                    st.warning(f"Could not process {file}")
+                    continue
 
-    if "X" not in st.session_state:
+                # TRAINING FILE
+                if torque is not None:
 
-        st.warning("Upload data first.")
+                    for feat in features:
 
-    else:
+                        X_train.append(feat)
+                        y_train.append(torque)
 
-        X = st.session_state["X"]
-        y = st.session_state["y"]
+                # EXPERIMENTAL FILE
+                else:
+
+                    experimental.append(
+                        (file, features)
+                    )
+
+        # ====================================================
+        # TRAIN MODEL
+        # ====================================================
+
+        X_train = np.array(X_train)
+        y_train = np.array(y_train)
+
+        st.subheader("Training Data")
+
+        st.write("Samples:", len(X_train))
+
+        unique = np.unique(y_train)
+
+        st.write("Torque Classes:", unique)
+
+        if len(unique) < 2:
+
+            st.error("""
+            Need at least TWO torque classes.
+
+            Example:
+            - 0ftlb
+            - 25ftlb
+            """)
+
+            st.stop()
 
         scaler = StandardScaler()
 
-        X = scaler.fit_transform(X)
+        X_scaled = scaler.fit_transform(X_train)
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X,
-            y,
+        Xtr, Xte, ytr, yte = train_test_split(
+            X_scaled,
+            y_train,
             test_size=0.3,
             random_state=42
         )
 
-        models = {
-
-            "KNN": KNeighborsClassifier(),
-
-            "Decision Tree": DecisionTreeClassifier(),
-
-            "Logistic Regression": LogisticRegression(max_iter=1000),
-
-            "SVM": SVC(probability=True),
-
-            "Random Forest": RandomForestClassifier()
-        }
-
-        best_acc = 0
-        best_model = None
-
-        for name, model in models.items():
-
-            model.fit(X_train, y_train)
-
-            pred = model.predict(X_test)
-
-            acc = accuracy_score(y_test, pred)
-
-            st.subheader(name)
-
-            st.write("Accuracy:", round(acc, 4))
-
-            cm = confusion_matrix(y_test, pred)
-
-            plot_cm(cm, name)
-
-            if acc > best_acc:
-                best_acc = acc
-                best_model = model
-
-        st.success(f"Best Model Accuracy: {best_acc:.4f}")
-
-        st.session_state["best_model"] = best_model
-        st.session_state["scaler"] = scaler
-
-# ============================================================
-# TAB 3
-# ============================================================
-
-with tab3:
-
-    if "best_model" not in st.session_state:
-
-        st.warning("Train model first.")
-
-    else:
-
-        test_files = st.file_uploader(
-            "Upload Test Audio",
-            accept_multiple_files=True,
-            key="test"
+        model = RandomForestClassifier(
+            n_estimators=200,
+            random_state=42
         )
 
-        if test_files:
+        model.fit(Xtr, ytr)
 
-            model = st.session_state["best_model"]
-            scaler = st.session_state["scaler"]
+        pred = model.predict(Xte)
 
-            for file in test_files:
+        acc = accuracy_score(yte, pred)
 
-                st.subheader(file.name)
+        st.success(f"Validation Accuracy: {acc:.4f}")
 
-                signal, sr = load_audio(file)
+        # ====================================================
+        # EXPERIMENTAL PREDICTIONS
+        # ====================================================
 
-                hits, boundaries = split_hits(signal, sr)
+        st.header("Experimental Predictions")
 
-                if len(hits) == 0:
+        for file, features in experimental:
 
-                    st.warning("No impacts detected")
-                    continue
+            if len(features) == 0:
+                continue
 
-                features = np.array([
-                    extract_features(h, sr)
-                    for h in hits
-                ])
+            features = scaler.transform(features)
 
-                features = scaler.transform(features)
+            preds = model.predict(features)
 
-                preds = model.predict(features)
+            final = int(np.bincount(preds).argmax())
 
-                probs = model.predict_proba(features)[:,1]
+            st.subheader(file)
 
-                confidence = np.mean(probs)
+            if final <= 10:
 
-                if confidence > 0.5:
+                st.error(f"⚠️ VERY LOOSE → {final} ft-lbs")
 
-                    st.error(
-                        f"⚠️ LOOSE FLANGE DETECTED ({confidence*100:.1f}%)"
-                    )
+            elif final <= 30:
 
-                else:
+                st.warning(f"⚠️ MODERATELY TIGHT → {final} ft-lbs")
 
-                    st.success(
-                        f"✅ TIGHT FLANGE ({(1-confidence)*100:.1f}%)"
-                    )
+            else:
 
-                draw_flange(confidence)
+                st.success(f"✅ TIGHT → {final} ft-lbs")
 
-                fig, ax = plt.subplots(figsize=(10,2))
+            draw_flange(final)
 
-                ax.plot(signal)
+            fig, ax = plt.subplots()
 
-                for s,e in boundaries:
-                    ax.axvspan(s,e,alpha=0.3)
+            ax.hist(preds)
 
-                st.pyplot(fig)
+            ax.set_title("Impact Predictions")
+
+            st.pyplot(fig)
