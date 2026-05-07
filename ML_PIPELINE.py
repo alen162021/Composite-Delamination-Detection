@@ -4,7 +4,6 @@ import pandas as pd
 import librosa
 import librosa.display
 import matplotlib.pyplot as plt
-import seaborn as sns
 import zipfile
 import tempfile
 import os
@@ -36,6 +35,7 @@ st.set_page_config(
 )
 
 st.title("🔩 Flange Looseness Detection & Machine Learning")
+
 st.caption("""
 Upload a ZIP dataset containing percussion recordings.
 
@@ -141,7 +141,7 @@ def load_audio(path):
     return signal, sr
 
 # ============================================================
-# HIT SPLITTING
+# SPLIT HITS
 # ============================================================
 
 def split_hits(signal, sr):
@@ -232,7 +232,7 @@ def extract_features(signal, sr):
     ])
 
 # ============================================================
-# VISUALIZATION
+# PLOTTING
 # ============================================================
 
 def plot_waveform(signal):
@@ -242,6 +242,10 @@ def plot_waveform(signal):
     ax.plot(signal)
 
     ax.set_title("Waveform")
+
+    ax.set_xlabel("Samples")
+
+    ax.set_ylabel("Amplitude")
 
     st.pyplot(fig)
 
@@ -263,6 +267,8 @@ def plot_fft(signal, sr):
 
     ax.set_xlabel("Frequency (Hz)")
 
+    ax.set_ylabel("Magnitude")
+
     st.pyplot(fig)
 
 
@@ -270,19 +276,29 @@ def plot_confusion_matrix(cm, labels, title):
 
     fig, ax = plt.subplots(figsize=(6,5))
 
-    sns.heatmap(
-        cm,
-        annot=True,
-        fmt='d',
-        cmap='Blues',
-        xticklabels=labels,
-        yticklabels=labels,
-        ax=ax
-    )
+    ax.imshow(cm)
+
+    ax.set_xticks(np.arange(len(labels)))
+    ax.set_yticks(np.arange(len(labels)))
+
+    ax.set_xticklabels(labels)
+    ax.set_yticklabels(labels)
 
     ax.set_xlabel("Predicted")
     ax.set_ylabel("Actual")
+
     ax.set_title(title)
+
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+
+            ax.text(
+                j,
+                i,
+                cm[i, j],
+                ha="center",
+                va="center"
+            )
 
     st.pyplot(fig)
 
@@ -310,10 +326,6 @@ if uploaded_zip:
     with zipfile.ZipFile(zip_path, "r") as zip_ref:
         zip_ref.extractall(temp_dir)
 
-    # ========================================================
-    # BUILD DATASET
-    # ========================================================
-
     X = []
     y = []
 
@@ -327,6 +339,10 @@ if uploaded_zip:
         ".wav"
     )
 
+    # ========================================================
+    # DATASET BUILDING
+    # ========================================================
+
     for root, dirs, files in os.walk(temp_dir):
 
         for file in files:
@@ -336,7 +352,6 @@ if uploaded_zip:
 
             full_path = os.path.join(root, file)
 
-            # TRAINING FILES
             parsed = parse_training_filename(file)
 
             if parsed is not None:
@@ -358,6 +373,7 @@ if uploaded_zip:
                         y.append(torque)
 
                         metadata.append({
+
                             "file": file,
                             "flange": flange,
                             "area": area,
@@ -370,25 +386,25 @@ if uploaded_zip:
 
             else:
 
-                parsed_unknown = parse_unknown_filename(file)
+                unknown = parse_unknown_filename(file)
 
-                if parsed_unknown is not None:
+                if unknown is not None:
 
                     unknown_files.append({
+
                         "file": file,
                         "path": full_path,
-                        "flange": parsed_unknown[0],
-                        "area": parsed_unknown[1]
+                        "flange": unknown[0],
+                        "area": unknown[1]
                     })
 
     # ========================================================
-    # CHECK DATA
+    # VALIDATION
     # ========================================================
 
     if len(X) == 0:
 
         st.error("No valid training files found.")
-
         st.stop()
 
     X = np.array(X)
@@ -399,53 +415,58 @@ if uploaded_zip:
     if len(unique_classes) < 2:
 
         st.error("Need at least 2 torque classes.")
-
         st.stop()
 
-    st.success(f"Training Samples Loaded: {len(X)}")
+    st.success(f"Loaded {len(X)} training samples")
 
-    st.write("Detected Torque Classes:")
-
+    st.write("Detected Classes:")
     st.write(sorted(unique_classes))
 
     # ========================================================
-    # SIGNAL DISPLAY
+    # SIGNAL ANALYSIS
     # ========================================================
 
     st.header("📈 Signal Analysis")
 
-    sample_signal, sample_sr = load_audio(
-        os.path.join(root, file)
-    )
+    sample_signal, sample_sr = load_audio(full_path)
 
-    sample_hit = split_hits(
+    sample_hits = split_hits(
         sample_signal,
         sample_sr
-    )[0]
+    )
 
-    col1, col2 = st.columns(2)
+    if len(sample_hits) > 0:
 
-    with col1:
-        plot_waveform(sample_hit)
+        sample_hit = sample_hits[0]
 
-    with col2:
-        plot_fft(sample_hit, sample_sr)
+        col1, col2 = st.columns(2)
+
+        with col1:
+            plot_waveform(sample_hit)
+
+        with col2:
+            plot_fft(sample_hit, sample_sr)
 
     # ========================================================
     # SPLIT
     # ========================================================
 
     X_train, X_test, y_train, y_test = train_test_split(
+
         X,
         y,
+
         test_size=0.3,
+
         random_state=42,
+
         stratify=y
     )
 
     scaler = StandardScaler()
 
     X_train = scaler.fit_transform(X_train)
+
     X_test = scaler.transform(X_test)
 
     # ========================================================
@@ -455,32 +476,37 @@ if uploaded_zip:
     models = {
 
         "Random Forest":
+
             RandomForestClassifier(
                 n_estimators=100,
                 random_state=42
             ),
 
         "SVM":
+
             SVC(
                 probability=True
             ),
 
         "Decision Tree":
+
             DecisionTreeClassifier(
                 random_state=42
             ),
 
         "Logistic Regression":
+
             LogisticRegression(
                 max_iter=2000
             ),
 
         "KNN":
+
             KNeighborsClassifier()
     }
 
     # ========================================================
-    # TRAINING
+    # MODEL TRAINING
     # ========================================================
 
     st.header("🤖 Model Evaluation")
@@ -492,46 +518,63 @@ if uploaded_zip:
 
     for name, model in models.items():
 
-        model.fit(X_train, y_train)
+        try:
 
-        pred = model.predict(X_test)
+            model.fit(X_train, y_train)
 
-        acc = accuracy_score(y_test, pred)
+            pred = model.predict(X_test)
 
-        cm = confusion_matrix(y_test, pred)
+            acc = accuracy_score(
+                y_test,
+                pred
+            )
 
-        results.append({
-            "Model": name,
-            "Accuracy": acc
-        })
+            cm = confusion_matrix(
+                y_test,
+                pred
+            )
 
-        if acc > best_acc:
+            results.append({
 
-            best_acc = acc
-            best_model = model
+                "Model": name,
+                "Accuracy": acc
+            })
 
-        st.subheader(name)
+            if acc > best_acc:
 
-        st.write(f"Accuracy: {acc:.4f}")
+                best_acc = acc
+                best_model = model
 
-        plot_confusion_matrix(
-            cm,
-            sorted(unique_classes),
-            f"{name} Confusion Matrix"
-        )
+            st.subheader(name)
 
-        report = classification_report(
-            y_test,
-            pred,
-            output_dict=True
-        )
+            st.write(f"Accuracy: {acc:.4f}")
 
-        st.dataframe(
-            pd.DataFrame(report).transpose()
-        )
+            plot_confusion_matrix(
+
+                cm,
+
+                sorted(unique_classes),
+
+                f"{name} Confusion Matrix"
+            )
+
+            report = classification_report(
+
+                y_test,
+                pred,
+                output_dict=True
+            )
+
+            st.dataframe(
+                pd.DataFrame(report).transpose()
+            )
+
+        except Exception as e:
+
+            st.warning(f"{name} failed: {e}")
 
     # ========================================================
-    # RESULTS TABLE
+    # RESULTS
     # ========================================================
 
     st.header("📊 Overall Results")
@@ -540,20 +583,24 @@ if uploaded_zip:
 
     st.dataframe(results_df)
 
-    best_name = results_df.sort_values(
-        "Accuracy",
-        ascending=False
-    ).iloc[0]["Model"]
+    if len(results_df) > 0:
 
-    st.success(
-        f"⭐ Best Model: {best_name}"
-    )
+        best_name = results_df.sort_values(
+
+            "Accuracy",
+            ascending=False
+
+        ).iloc[0]["Model"]
+
+        st.success(
+            f"⭐ Best Model: {best_name}"
+        )
 
     # ========================================================
     # UNKNOWN PREDICTION
     # ========================================================
 
-    if len(unknown_files) > 0:
+    if len(unknown_files) > 0 and best_model is not None:
 
         st.header("🧪 Unknown Flange Prediction")
 
@@ -563,7 +610,9 @@ if uploaded_zip:
 
             try:
 
-                signal, sr = load_audio(item["path"])
+                signal, sr = load_audio(
+                    item["path"]
+                )
 
                 hits = split_hits(signal, sr)
 
@@ -590,9 +639,15 @@ if uploaded_zip:
 
                 prediction_rows.append({
 
-                    "File": item["file"],
-                    "Flange": item["flange"],
-                    "Area": item["area"],
+                    "File":
+                        item["file"],
+
+                    "Flange":
+                        item["flange"],
+
+                    "Area":
+                        item["area"],
+
                     "Predicted Torque":
                         f"{final_pred} ft-lb",
 
@@ -600,7 +655,7 @@ if uploaded_zip:
                         f"{confidence*100:.1f}%"
                 })
 
-            except:
+            except Exception as e:
 
                 st.warning(
                     f"Could not process {item['file']}"
@@ -615,19 +670,21 @@ if uploaded_zip:
             st.dataframe(pred_df)
 
     # ========================================================
-    # FLANGE ANALYSIS
+    # FLANGE DISTRIBUTION
     # ========================================================
 
     st.header("🔩 Flange Distribution")
 
     metadata_df = pd.DataFrame(metadata)
 
-    flange_counts = (
-        metadata_df.groupby(
-            ["flange", "torque"]
-        )
-        .size()
-        .unstack(fill_value=0)
-    )
+    if len(metadata_df) > 0:
 
-    st.bar_chart(flange_counts)
+        flange_counts = (
+
+            metadata_df
+            .groupby(["flange", "torque"])
+            .size()
+            .unstack(fill_value=0)
+        )
+
+        st.bar_chart(flange_counts)
